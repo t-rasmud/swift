@@ -5094,26 +5094,72 @@ void irgen::emitAsyncFunctionEntry(IRGenFunction &IGF,
   IGF.setupAsync(asyncContextIndex);
 }
 
+static llvm::Constant *getCoroFrameAllocStubFn(IRGenModule &IGM) {
+  return IGM.getOrCreateHelperFunction(
+      "__swift_coroFrameAllocStub", IGM.Int8PtrTy,
+      {IGM.SizeTy},
+      [&](IRGenFunction &IGF) {
+        if (IGM.DebugInfo)
+          IGM.DebugInfo->emitArtificialFunction(IGF, IGF.CurFn);
+
+        auto parameters = IGF.collectParameters();
+        auto *size = parameters.claimNext();
+        auto *coroFrameAllocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getCoroFrameAllocFn());
+        auto *nullSwiftCoroFrameAlloc = IGF.Builder.CreateCmp(
+          llvm::CmpInst::Predicate::ICMP_NE, coroFrameAllocFn,
+          llvm::ConstantPointerNull::get(
+              cast<llvm::PointerType>(coroFrameAllocFn->getType())));
+        auto *coroFrameAllocReturn = IGF.createBasicBlock("return-coroFrameAlloc");
+        auto *mallocReturn = IGF.createBasicBlock("return-malloc");
+        IGF.Builder.CreateCondBr(nullSwiftCoroFrameAlloc, coroFrameAllocReturn, coroFrameAllocReturn);
+
+        IGF.Builder.emitBlock(coroFrameAllocReturn);
+        auto mallocTypeId = IGF.getMallocTypeId();
+        auto *coroFrameAllocCall = IGF.Builder.CreateCall(IGF.IGM.getCoroFrameAllocFunctionPointer(), {size, mallocTypeId});
+        IGF.Builder.CreateRet(coroFrameAllocCall);
+
+        // llvm::Constant *allocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getCoroFrameAllocFn());
+        // auto fun = cast<llvm::Function>(allocFn);
+        // auto fnType = cast<llvm::FunctionType>(fun->getValueType());
+        // llvm::CallInst *Call = IGF.Builder.CreateCallWithoutDbgLoc(fnType, allocFn, {size, mallocTypeId});
+        // IGF.Builder.CreateRet(Call);
+
+        IGF.Builder.emitBlock(mallocReturn);
+        auto *mallocCall = IGF.Builder.CreateCall(IGF.IGM.getMallocFunctionPointer(), {size});
+        IGF.Builder.CreateRet(mallocCall);
+        // llvm::Constant *mallocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getMallocFn());
+        // auto mallocFun = cast<llvm::Function>(mallocFn);
+        // auto mallocFnType = cast<llvm::FunctionType>(mallocFun->getValueType());
+        // llvm::CallInst *mallocCall = IGF.Builder.CreateCallWithoutDbgLoc(mallocFnType, mallocFn, {size});
+        // IGF.Builder.CreateRet(mallocCall);
+      },
+      /*setIsNoInline=*/false,
+      /*forPrologue=*/false,
+      /*isPerformanceConstraint=*/false,
+      /*optionalLinkageOverride=*/nullptr, llvm::CallingConv::C);
+}
+
 void irgen::emitYieldOnceCoroutineEntry(
     IRGenFunction &IGF, CanSILFunctionType fnType,
     NativeCCEntryPointArgumentEmission &emission) {
   // Use malloc and free as our allocator.
   auto deallocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getFreeFn());
   auto *buffer = emission.getCoroutineBuffer();
-  llvm::SmallVector<llvm::Value *, 2> finalArgs;
-  llvm::Constant *allocFn = nullptr;
-  if (IGF.getOptions().EmitTypeMallocForCoroFrame) {
-    auto mallocTypeId = IGF.getMallocTypeId();
-    finalArgs.push_back(mallocTypeId);
-    allocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getCoroFrameAllocFn());
-  } else {
-    allocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getMallocFn());
-  }
+  auto allocFn = IGF.IGM.getOpaquePtr(getCoroFrameAllocStubFn(IGF.IGM));
+  // llvm::SmallVector<llvm::Value *, 2> finalArgs;
+  // llvm::Constant *allocFn = nullptr;
+  // if (IGF.getOptions().EmitTypeMallocForCoroFrame) {
+  //   auto mallocTypeId = IGF.getMallocTypeId();
+  //   finalArgs.push_back(mallocTypeId);
+  //   allocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getCoroFrameAllocFn());
+  // } else {
+  //   allocFn = IGF.IGM.getOpaquePtr(IGF.IGM.getMallocFn());
+  // }
   emitRetconCoroutineEntry(IGF, fnType, buffer,
                            llvm::Intrinsic::coro_id_retcon_once,
                            getYieldOnceCoroutineBufferSize(IGF.IGM),
                            getYieldOnceCoroutineBufferAlignment(IGF.IGM), {},
-                           allocFn, deallocFn, finalArgs);
+                           allocFn, deallocFn, {});
 }
 
 void irgen::emitYieldManyCoroutineEntry(
